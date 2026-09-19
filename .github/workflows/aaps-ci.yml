@@ -106,8 +106,15 @@ jobs:
             fi
           }
 
-          # Check secrets
-          check_secret "$GDRIVE_OAUTH2" "GDRIVE_OAUTH2"
+          # Google Drive upload is optional. APKs are always attached to the
+          # workflow run, so a missing GDRIVE_OAUTH2 must not fail the build.
+          if [ -n "$GDRIVE_OAUTH2" ]; then
+            echo "GDRIVE_ENABLED=true" >> $GITHUB_ENV
+            echo "ℹ️ GDRIVE_OAUTH2 present, APKs will also go to Google Drive."
+          else
+            echo "GDRIVE_ENABLED=false" >> $GITHUB_ENV
+            echo "ℹ️ GDRIVE_OAUTH2 not set, skipping Google Drive upload."
+          fi
 
           check_secret "$KEYSTORE_BASE64" "KEYSTORE_BASE64"
           check_secret "$KEYSTORE_PASSWORD" "KEYSTORE_PASSWORD"
@@ -156,28 +163,43 @@ jobs:
           echo "✅ Keystore and credentials validated."
 
       - name: Decode GDrive OAuth2 secrets
+        if: env.GDRIVE_ENABLED == 'true'
         run: |
           echo "🔐 Decoding GDRIVE_OAUTH2..."
           DECODED=$(echo "${{ secrets.GDRIVE_OAUTH2 }}" | base64 -d)
 
           GDRIVE_CLIENT_ID=$(echo "$DECODED" | cut -d'|' -f1)
           GDRIVE_REFRESH_TOKEN=$(echo "$DECODED" | cut -d'|' -f2)
+          # Public (iOS/Android) OAuth clients have no secret; Desktop/Web ones
+          # require it on refresh, so field 3 is optional.
+          GDRIVE_CLIENT_SECRET=$(echo "$DECODED" | cut -d'|' -f3)
 
           echo "::add-mask::$GDRIVE_CLIENT_ID"
           echo "::add-mask::$GDRIVE_REFRESH_TOKEN"
+          if [ -n "$GDRIVE_CLIENT_SECRET" ]; then echo "::add-mask::$GDRIVE_CLIENT_SECRET"; fi
 
           echo "GDRIVE_CLIENT_ID=$GDRIVE_CLIENT_ID" >> $GITHUB_ENV
           echo "GDRIVE_REFRESH_TOKEN=$GDRIVE_REFRESH_TOKEN" >> $GITHUB_ENV
+          echo "GDRIVE_CLIENT_SECRET=$GDRIVE_CLIENT_SECRET" >> $GITHUB_ENV
 
           echo "✅ GDRIVE_CLIENT_ID and GDRIVE_REFRESH_TOKEN extracted from GDRIVE_OAUTH2"
 
       - name: Retrieving Google Drive access token
+        if: env.GDRIVE_ENABLED == 'true'
         run: |
           echo "🔐 Getting Google OAuth2 access token..."
-          TOKEN_RESPONSE=$(curl -s -X POST https://oauth2.googleapis.com/token \
-            -d client_id="$GDRIVE_CLIENT_ID" \
-            -d refresh_token="$GDRIVE_REFRESH_TOKEN" \
-            -d grant_type=refresh_token)
+          if [ -n "$GDRIVE_CLIENT_SECRET" ]; then
+            TOKEN_RESPONSE=$(curl -s -X POST https://oauth2.googleapis.com/token \
+              -d client_id="$GDRIVE_CLIENT_ID" \
+              -d client_secret="$GDRIVE_CLIENT_SECRET" \
+              -d refresh_token="$GDRIVE_REFRESH_TOKEN" \
+              -d grant_type=refresh_token)
+          else
+            TOKEN_RESPONSE=$(curl -s -X POST https://oauth2.googleapis.com/token \
+              -d client_id="$GDRIVE_CLIENT_ID" \
+              -d refresh_token="$GDRIVE_REFRESH_TOKEN" \
+              -d grant_type=refresh_token)
+          fi
           ACCESS_TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r .access_token)
           echo "::add-mask::$ACCESS_TOKEN"
           if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
@@ -272,7 +294,18 @@ jobs:
           mv app/build/outputs/apk/${{ env.VARIANT_FLAVOR }}/${{ env.VARIANT_TYPE }}/*.apk aaps-${{ env.VERSION }}${{ env.VERSION_SUFFIX }}.apk
           mv wear/build/outputs/apk/${{ env.VARIANT_FLAVOR }}/${{ env.VARIANT_TYPE }}/*.apk aaps-wear-${{ env.VERSION }}${{ env.VERSION_SUFFIX }}.apk
 
+      - name: Attach APKs to workflow run
+        uses: actions/upload-artifact@v4
+        with:
+          name: aaps-${{ env.VERSION }}${{ env.VERSION_SUFFIX }}
+          path: |
+            aaps-${{ env.VERSION }}${{ env.VERSION_SUFFIX }}.apk
+            aaps-wear-${{ env.VERSION }}${{ env.VERSION_SUFFIX }}.apk
+          if-no-files-found: error
+          retention-days: 90
+
       - name: Upload APKs to Google Drive
+        if: env.GDRIVE_ENABLED == 'true'
         run: |
           set -e
           echo "🔐 Start uploading APKs to Google Drive..."
